@@ -10,7 +10,7 @@ export default async function HomePage() {
   return <main style={{ padding: "48px", maxWidth: 1180, margin: "0 auto" }}>
     <nav style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 56 }}>
       <strong>ShipFlow AI</strong>
-      <div style={{ display: "flex", gap: 18, color: "var(--muted)" }}><Link href="/intake">Plan release</Link><Link href="/workflows">Workflows</Link></div>
+      <div style={{ display: "flex", gap: 18, color: "var(--muted)" }}><Link href="/dashboard">Dashboard</Link><Link href="/intake">Plan release</Link><Link href="/workflows">Workflows</Link></div>
     </nav>
     <section style={{ display: "grid", gridTemplateColumns: "1.2fr .8fr", gap: 24, alignItems: "stretch" }}>
       <Card>
