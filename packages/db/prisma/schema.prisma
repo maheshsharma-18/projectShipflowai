@@ -38,6 +38,13 @@ enum FeatureRequestPriority {
   urgent
 }
 
+enum FeatureRequestSource {
+  manual
+  email_import
+  support_ticket
+  customer_call_transcript
+}
+
 enum ClarificationQuestionStatus {
   open
   answered
@@ -269,6 +276,7 @@ model FeatureRequest {
   title                  String
   description            String
   priority               FeatureRequestPriority  @default(medium)
+  source                 FeatureRequestSource    @default(manual)
   status                 CoreLoopStatus          @default(request_intake)
   metadata               Json?
   createdAt              DateTime                @default(now())

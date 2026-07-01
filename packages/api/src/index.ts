@@ -1,6 +1,6 @@
 import { TRPCError, initTRPC } from "@trpc/server";
 import { z } from "zod";
-import { createReleasePlan } from "@shipflow/ai";
+import { clarifyFeatureRequest, createReleasePlan } from "@shipflow/ai";
 import { db, type WorkspaceRole } from "@shipflow/db";
 import { summarizePullRequestEvent, githubWebhookSchema } from "@shipflow/github";
 import type { AuthContext } from "@shipflow/auth";
@@ -33,6 +33,42 @@ const authedProcedure = publicProcedure.use(requireAuth);
 const workspaceProcedure = publicProcedure.use(requireWorkspaceAccess);
 const adminProcedure = workspaceProcedure.use(requireRole(["owner", "admin"]));
 
+const featureRequestSourceSchema = z.enum(["manual", "email_import", "support_ticket", "customer_call_transcript"]);
+const featureRequestPrioritySchema = z.enum(["low", "medium", "high", "urgent"]);
+const placeholderFeatureRequestSourceSchema = z.enum(["email_import", "support_ticket", "customer_call_transcript"]);
+
+async function runAndPersistClarification(featureRequestId: string, workspaceId: string, projectId?: string | null) {
+  const featureRequest = await db.prisma.featureRequest.findFirst({ where: { id: featureRequestId, workspaceId } });
+  if (!featureRequest) throw new TRPCError({ code: "NOT_FOUND", message: "Feature request not found." });
+  const existingFeatures = await db.prisma.featureRequest.findMany({
+    where: { workspaceId, projectId: projectId ?? featureRequest.projectId, id: { not: featureRequestId } },
+    select: { id: true, title: true, description: true },
+    take: 25,
+    orderBy: { updatedAt: "desc" }
+  });
+  const project = featureRequest.projectId ? await db.prisma.project.findFirst({ where: { id: featureRequest.projectId, workspaceId } }) : null;
+  const clarification = clarifyFeatureRequest({
+    title: featureRequest.title,
+    description: featureRequest.description,
+    projectContext: project?.description,
+    existingFeatures
+  });
+  await db.prisma.clarificationQuestion.deleteMany({ where: { featureRequestId, status: "open" } });
+  if (clarification.questions.length > 0) {
+    await db.prisma.clarificationQuestion.createMany({
+      data: clarification.questions.map((item) => ({ workspaceId, featureRequestId, question: item.question }))
+    });
+  }
+  return db.prisma.featureRequest.update({
+    where: { id: featureRequestId },
+    data: {
+      status: clarification.recommendation === "ask_follow_up" ? "clarification" : "prd_draft",
+      metadata: { ...((featureRequest.metadata as Record<string, unknown> | null) ?? {}), clarification }
+    },
+    include: { project: true, requester: true, clarificationQuestions: { orderBy: { createdAt: "asc" } } }
+  });
+}
+
 export const appRouter = router({
   health: publicProcedure.query(() => ({ ok: true, service: "shipflow-api" })),
   viewer: authedProcedure.query(({ ctx }) => ({ user: ctx.session, workspace: ctx.workspace, workspaces: ctx.workspaces })),
@@ -51,6 +87,60 @@ export const appRouter = router({
     list: workspaceProcedure.query(({ ctx }) => db.release.list(ctx.workspace.workspaceId)),
     byId: workspaceProcedure.input(z.object({ id: z.string() })).query(({ ctx, input }) => db.release.byId(input.id, ctx.workspace.workspaceId)),
     plan: workspaceProcedure.input(z.object({ goal: z.string().min(8), repository: z.string().optional(), branch: z.string().optional() })).mutation(({ input }) => createReleasePlan(input))
+  }),
+
+  featureRequests: router({
+    list: workspaceProcedure.input(z.object({ projectId: z.string().optional() }).optional()).query(({ ctx, input }) => db.prisma.featureRequest.findMany({
+      where: { workspaceId: ctx.workspace.workspaceId, projectId: input?.projectId },
+      include: { project: true, clarificationQuestions: true },
+      orderBy: { updatedAt: "desc" }
+    })),
+    byId: workspaceProcedure.input(z.object({ id: z.string() })).query(({ ctx, input }) => db.prisma.featureRequest.findFirst({
+      where: { id: input.id, workspaceId: ctx.workspace.workspaceId },
+      include: { project: true, requester: true, clarificationQuestions: { include: { answeredBy: true }, orderBy: { createdAt: "asc" } } }
+    })),
+    create: workspaceProcedure.input(z.object({
+      projectId: z.string(),
+      title: z.string().min(4),
+      description: z.string().min(10),
+      priority: featureRequestPrioritySchema.default("medium"),
+      source: featureRequestSourceSchema.default("manual")
+    })).mutation(async ({ ctx, input }) => {
+      const project = await db.prisma.project.findFirst({ where: { id: input.projectId, workspaceId: ctx.workspace.workspaceId } });
+      if (!project) throw new TRPCError({ code: "NOT_FOUND", message: "Project not found." });
+      const featureRequest = await db.prisma.featureRequest.create({
+        data: {
+          workspaceId: ctx.workspace.workspaceId,
+          projectId: input.projectId,
+          requesterId: ctx.session.userId,
+          title: input.title,
+          description: input.description,
+          priority: input.priority,
+          source: input.source as never,
+          metadata: { source: input.source }
+        } as never
+      });
+      return runAndPersistClarification(featureRequest.id, ctx.workspace.workspaceId, input.projectId);
+    }),
+    createPlaceholder: workspaceProcedure.input(z.object({ projectId: z.string(), source: placeholderFeatureRequestSourceSchema })).mutation(async ({ ctx, input }) => {
+      const labels = { email_import: "Email/import", support_ticket: "Support ticket", customer_call_transcript: "Customer call transcript" };
+      const featureRequest = await db.prisma.featureRequest.create({
+        data: {
+          workspaceId: ctx.workspace.workspaceId,
+          projectId: input.projectId,
+          requesterId: ctx.session.userId,
+          title: `${labels[input.source]} placeholder`,
+          description: `Placeholder created for ${labels[input.source].toLowerCase()} intake. Replace this with imported customer evidence before PRD generation.`,
+          source: input.source as never,
+          metadata: { source: input.source, placeholder: true }
+        } as never
+      });
+      return runAndPersistClarification(featureRequest.id, ctx.workspace.workspaceId, input.projectId);
+    }),
+    answerQuestion: workspaceProcedure.input(z.object({ questionId: z.string(), answer: z.string().min(1) })).mutation(({ ctx, input }) => db.prisma.clarificationQuestion.update({
+      where: { id: input.questionId },
+      data: { answer: input.answer, status: "answered", answeredById: ctx.session.userId, answeredAt: new Date() }
+    }))
   }),
   projects: router({
     list: workspaceProcedure.query(({ ctx }) => db.prisma.project.findMany({ where: { workspaceId: ctx.workspace.workspaceId }, orderBy: { updatedAt: "desc" } })),
