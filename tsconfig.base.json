@@ -1,0 +1,46 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": [
+      "dom",
+      "dom.iterable",
+      "ES2022"
+    ],
+    "strict": true,
+    "skipLibCheck": true,
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "preserve",
+    "noEmit": true,
+    "baseUrl": ".",
+    "paths": {
+      "@shipflow/api": [
+        "packages/api/src/index.ts"
+      ],
+      "@shipflow/auth": [
+        "packages/auth/src/index.ts"
+      ],
+      "@shipflow/config": [
+        "packages/config/src/index.ts"
+      ],
+      "@shipflow/db": [
+        "packages/db/src/index.ts"
+      ],
+      "@shipflow/ai": [
+        "packages/ai/src/index.ts"
+      ],
+      "@shipflow/github": [
+        "packages/github/src/index.ts"
+      ],
+      "@shipflow/workflows": [
+        "packages/workflows/src/index.ts"
+      ],
+      "@shipflow/ui": [
+        "packages/ui/src/index.ts"
+      ]
+    },
+    "ignoreDeprecations": "6.0"
+  }
+}
