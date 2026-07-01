@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "better-auth": "^1.1.0",
-    "@shipflow/config": "*"
+    "@shipflow/config": "*",
+    "@shipflow/db": "*"
   }
 }
