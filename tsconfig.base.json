@@ -38,9 +38,9 @@
         "packages/workflows/src/index.ts"
       ],
       "@shipflow/ui": [
-        "packages/ui/src/index.ts"
+        "packages/ui/src/index.tsx"
       ]
     },
-    "ignoreDeprecations": "6.0"
+    "ignoreDeprecations": "5.0"
   }
 }
