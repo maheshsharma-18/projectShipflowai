@@ -60,7 +60,7 @@ export function clarifyFeatureRequest(input: FeatureClarificationInput): Feature
     return feature.title.toLowerCase() === input.title.toLowerCase() || sharedWords.length >= Math.min(3, titleWords.size);
   }).map((feature) => feature.id);
 
-  const missing = (Object.entries(dimensionSignals) as [Exclude<ClarificationDimension, "existing_feature" | "actionability">, string[]][])
+  const missing: ClarificationDimension[] = (Object.entries(dimensionSignals) as [Exclude<ClarificationDimension, "existing_feature" | "actionability">, string[]][])
     .filter(([, signals]) => !signals.some((signal) => text.includes(signal)))
     .map(([dimension]) => dimension);
 
@@ -81,4 +81,72 @@ export function clarifyFeatureRequest(input: FeatureClarificationInput): Feature
     recommendation: questions.length > 0 ? "ask_follow_up" : "proceed_to_prd",
     rationale: questions.length > 0 ? "The request needs more clarification before PRD generation." : "The request has enough user, problem, goal, constraint, edge-case, and business context to draft a PRD."
   };
+}
+
+export type PRDUserStory = { persona: string; need: string; benefit: string };
+export type PRDStructured = {
+  problemStatement: string;
+  goals: string[];
+  nonGoals: string[];
+  userStories: PRDUserStory[];
+  acceptanceCriteria: string[];
+  edgeCases: string[];
+  successMetrics: string[];
+};
+export type PRDGenerationInput = {
+  title: string;
+  description: string;
+  projectContext?: string | null;
+  clarificationAnswers?: { question: string; answer?: string | null }[];
+};
+export type PRDGenerationResult = PRDStructured & { editableMarkdown: string };
+
+function compactList(values: (string | null | undefined)[], fallback: string[]): string[] {
+  const cleaned = values.map((value) => value?.trim()).filter((value): value is string => Boolean(value));
+  return cleaned.length > 0 ? cleaned : fallback;
+}
+
+export function generatePRD(input: PRDGenerationInput): PRDGenerationResult {
+  const answeredClarifications = (input.clarificationAnswers ?? []).filter((item) => item.answer?.trim());
+  const answerText = answeredClarifications.map((item) => `${item.question}: ${item.answer}`).join("\n");
+  const context = compactList([input.projectContext, answerText], ["No additional project context was provided."]);
+  const problemStatement = `${input.title}: ${input.description}`;
+  const goals = compactList([
+    `Deliver the requested capability for the feature request: ${input.title}.`,
+    answeredClarifications.find((item) => /success|goal|outcome|measured/i.test(item.question))?.answer,
+    input.projectContext ? `Fit the solution into the existing project context: ${input.projectContext}` : null
+  ], ["Clarify and deliver the highest-value user outcome."]);
+  const nonGoals = [
+    "Do not expand scope beyond the clarified feature request without product owner approval.",
+    "Do not start engineering task generation until this PRD is approved."
+  ];
+  const userStories = [{
+    persona: answeredClarifications.find((item) => /who|user|customer|segment|persona/i.test(item.question))?.answer ?? "Product owner or target user",
+    need: input.title,
+    benefit: answeredClarifications.find((item) => /problem|pain|outcome|benefit/i.test(item.question))?.answer ?? "the requested workflow can be completed reliably"
+  }];
+  const acceptanceCriteria = compactList([
+    `Given the target user needs ${input.title}, when they use the completed feature, then the behavior described in the request is available.`,
+    ...answeredClarifications.map((item) => `The implementation accounts for clarification: ${item.question} — ${item.answer}.`)
+  ], ["Acceptance criteria must be finalized by the product owner before approval."]);
+  const edgeCases = compactList([
+    answeredClarifications.find((item) => /edge|failure|exception|fallback|empty|error/i.test(item.question))?.answer,
+    "Handle missing, invalid, or unauthorized data without breaking the user workflow."
+  ], ["No edge cases were provided; validate empty, error, and permission states before build."]);
+  const successMetrics = compactList([
+    answeredClarifications.find((item) => /success|metric|measure|kpi|outcome/i.test(item.question))?.answer,
+    "Product owner approves the PRD and generated implementation tasks map back to every acceptance criterion."
+  ], ["Define measurable adoption, completion, or quality metrics before launch."]);
+  const editableMarkdown = [
+    `# ${input.title} PRD`,
+    "", "## Problem statement", problemStatement,
+    "", "## Project context", ...context,
+    "", "## Goals", ...goals.map((item) => `- ${item}`),
+    "", "## Non-goals", ...nonGoals.map((item) => `- ${item}`),
+    "", "## User stories", ...userStories.map((story) => `- As ${story.persona}, I want ${story.need}, so that ${story.benefit}.`),
+    "", "## Acceptance criteria", ...acceptanceCriteria.map((item) => `- ${item}`),
+    "", "## Edge cases", ...edgeCases.map((item) => `- ${item}`),
+    "", "## Success metrics", ...successMetrics.map((item) => `- ${item}`)
+  ].join("\n");
+  return { problemStatement, goals, nonGoals, userStories, acceptanceCriteria, edgeCases, successMetrics, editableMarkdown };
 }

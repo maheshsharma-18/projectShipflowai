@@ -320,6 +320,7 @@ model PRD {
   featureRequestId String
   title            String
   content          String
+  structured       Json
   status           PRDStatus       @default(draft)
   version          Int             @default(1)
   approvedAt       DateTime?

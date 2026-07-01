@@ -1,6 +1,6 @@
 import { TRPCError, initTRPC } from "@trpc/server";
 import { z } from "zod";
-import { clarifyFeatureRequest, createReleasePlan } from "@shipflow/ai";
+import { clarifyFeatureRequest, createReleasePlan, generatePRD } from "@shipflow/ai";
 import { db, type WorkspaceRole } from "@shipflow/db";
 import { summarizePullRequestEvent, githubWebhookSchema } from "@shipflow/github";
 import type { AuthContext } from "@shipflow/auth";
@@ -36,6 +36,41 @@ const adminProcedure = workspaceProcedure.use(requireRole(["owner", "admin"]));
 const featureRequestSourceSchema = z.enum(["manual", "email_import", "support_ticket", "customer_call_transcript"]);
 const featureRequestPrioritySchema = z.enum(["low", "medium", "high", "urgent"]);
 const placeholderFeatureRequestSourceSchema = z.enum(["email_import", "support_ticket", "customer_call_transcript"]);
+
+
+async function generateAndPersistPRD(featureRequestId: string, workspaceId: string) {
+  const featureRequest = await db.prisma.featureRequest.findFirst({
+    where: { id: featureRequestId, workspaceId },
+    include: {
+      project: true,
+      clarificationQuestions: { orderBy: { createdAt: "asc" } },
+      prds: { orderBy: { version: "desc" }, take: 1 }
+    }
+  });
+  if (!featureRequest) throw new TRPCError({ code: "NOT_FOUND", message: "Feature request not found." });
+  const openQuestions = featureRequest.clarificationQuestions.filter((question) => question.status === "open");
+  if (openQuestions.length > 0) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Answer or skip clarification questions before generating a PRD." });
+  const generated = generatePRD({
+    title: featureRequest.title,
+    description: featureRequest.description,
+    projectContext: featureRequest.project?.description,
+    clarificationAnswers: featureRequest.clarificationQuestions.map((question) => ({ question: question.question, answer: question.answer }))
+  });
+  const latestVersion = featureRequest.prds[0]?.version ?? 0;
+  await db.prisma.pRD.updateMany({ where: { featureRequestId, workspaceId, status: "draft" }, data: { status: "superseded" } });
+  const prd = await db.prisma.pRD.create({
+    data: {
+      workspaceId,
+      featureRequestId,
+      title: `${featureRequest.title} PRD`,
+      content: generated.editableMarkdown,
+      structured: generated,
+      version: latestVersion + 1
+    }
+  });
+  await db.prisma.featureRequest.update({ where: { id: featureRequestId }, data: { status: "prd_draft" } });
+  return prd;
+}
 
 async function runAndPersistClarification(featureRequestId: string, workspaceId: string, projectId?: string | null) {
   const featureRequest = await db.prisma.featureRequest.findFirst({ where: { id: featureRequestId, workspaceId } });
@@ -81,7 +116,7 @@ export const appRouter = router({
       return workspace;
     }),
     members: workspaceProcedure.query(({ ctx }) => db.prisma.workspaceMember.findMany({ where: { workspaceId: ctx.workspace.workspaceId }, include: { user: true }, orderBy: { createdAt: "asc" } })),
-    updateMemberRole: adminProcedure.input(z.object({ userId: z.string(), role: z.enum(["owner", "admin", "product", "engineer", "reviewer", "billing"]) })).mutation(({ ctx, input }) => db.prisma.workspaceMember.update({ where: { workspaceId_userId: { workspaceId: ctx.workspace.workspaceId, userId: input.userId } }, data: { role: input.role } }))
+    updateMemberRole: adminProcedure.input(z.object({ userId: z.string(), role: z.enum(["owner", "admin", "product", "engineer", "reviewer", "billing"]) })).mutation(({ ctx, input }) => db.prisma.workspaceMember.update({ where: { workspaceId_userId: { workspaceId: ctx.workspace!.workspaceId, userId: input.userId } }, data: { role: input.role } }))
   }),
   releases: router({
     list: workspaceProcedure.query(({ ctx }) => db.release.list(ctx.workspace.workspaceId)),
@@ -141,6 +176,49 @@ export const appRouter = router({
       where: { id: input.questionId },
       data: { answer: input.answer, status: "answered", answeredById: ctx.session.userId, answeredAt: new Date() }
     }))
+  }),
+
+  prds: router({
+    byFeatureRequest: workspaceProcedure.input(z.object({ featureRequestId: z.string() })).query(({ ctx, input }) => db.prisma.pRD.findMany({
+      where: { featureRequestId: input.featureRequestId, workspaceId: ctx.workspace.workspaceId },
+      orderBy: { version: "desc" }
+    })),
+    generate: workspaceProcedure.input(z.object({ featureRequestId: z.string() })).mutation(({ ctx, input }) => generateAndPersistPRD(input.featureRequestId, ctx.workspace.workspaceId)),
+    update: workspaceProcedure.input(z.object({ id: z.string(), content: z.string().min(1), structured: z.unknown().optional() })).mutation(async ({ ctx, input }) => {
+      const prd = await db.prisma.pRD.findFirst({ where: { id: input.id, workspaceId: ctx.workspace.workspaceId } });
+      if (!prd) throw new TRPCError({ code: "NOT_FOUND", message: "PRD not found." });
+      if (prd.status === "approved") throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Approved PRDs cannot be edited. Regenerate a new draft instead." });
+      return db.prisma.pRD.update({ where: { id: input.id }, data: { content: input.content, structured: input.structured ?? prd.structured } as never });
+    }),
+    approve: workspaceProcedure.input(z.object({ id: z.string() })).mutation(async ({ ctx, input }) => {
+      const prd = await db.prisma.pRD.findFirst({ where: { id: input.id, workspaceId: ctx.workspace.workspaceId } });
+      if (!prd) throw new TRPCError({ code: "NOT_FOUND", message: "PRD not found." });
+      await db.prisma.pRD.updateMany({ where: { featureRequestId: prd.featureRequestId, workspaceId: ctx.workspace.workspaceId, status: "approved", id: { not: prd.id } }, data: { status: "superseded", approvedAt: null } });
+      const approved = await db.prisma.pRD.update({ where: { id: prd.id }, data: { status: "approved", approvedAt: new Date() } });
+      await db.prisma.featureRequest.update({ where: { id: prd.featureRequestId }, data: { status: "prd_approved" } });
+      return approved;
+    }),
+    regenerate: workspaceProcedure.input(z.object({ featureRequestId: z.string() })).mutation(({ ctx, input }) => generateAndPersistPRD(input.featureRequestId, ctx.workspace.workspaceId))
+  }),
+
+  engineeringTasks: router({
+    generate: workspaceProcedure.input(z.object({ featureRequestId: z.string() })).mutation(async ({ ctx, input }) => {
+      const latestPrd = await db.prisma.pRD.findFirst({
+        where: { featureRequestId: input.featureRequestId, workspaceId: ctx.workspace.workspaceId },
+        orderBy: [{ version: "desc" }, { createdAt: "desc" }]
+      });
+      if (!latestPrd || latestPrd.status !== "approved") throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Approve the latest PRD before generating engineering tasks." });
+      return db.prisma.engineeringTask.create({
+        data: {
+          workspaceId: ctx.workspace.workspaceId,
+          featureRequestId: input.featureRequestId,
+          prdId: latestPrd.id,
+          title: `Implement ${latestPrd.title}`,
+          description: latestPrd.content,
+          position: 0
+        }
+      });
+    })
   }),
   projects: router({
     list: workspaceProcedure.query(({ ctx }) => db.prisma.project.findMany({ where: { workspaceId: ctx.workspace.workspaceId }, orderBy: { updatedAt: "desc" } })),
